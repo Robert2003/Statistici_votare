@@ -99,8 +99,21 @@ class DataProcessor:
         # Check if we have countries in cache
         if "COUNTRY_LIST" in self.cached:
             print("Using cached country list")
-            return self.cached["COUNTRY_LIST"]
-        
+            countries = self.cached["COUNTRY_LIST"]
+            
+            # Sort countries by votes if we have vote data
+            if self.LATEST_DATA:
+                try:
+                    # Sort by round2 vote count in descending order
+                    countries = sorted(countries, 
+                                      key=lambda country: self.LATEST_DATA.get(country, {}).get('round2', 0),
+                                      reverse=True)
+                except Exception as e:
+                    print(f"Error sorting countries by votes: {e}")
+                    # Fall back to alphabetical sort if sorting by votes fails
+                    return sorted(countries)
+            return countries
+    
         print("Fetching country list from API")
         countries = set()
         
@@ -123,22 +136,54 @@ class DataProcessor:
                     if ROMANIA_NAME in countries:
                         countries.remove(ROMANIA_NAME)
                     
+                    # Convert to list
+                    countries_list = list(countries)
+                    
+                    # Get vote data to sort by
+                    vote_data = {}
+                    for country in countries_list:
+                        try:
+                            country_data = data[data["uat.name"] == country]
+                            total_votes = country_data["LT"].sum()
+                            vote_data[country] = total_votes
+                        except Exception as e:
+                            print(f"Error getting vote data for {country}: {e}")
+                            vote_data[country] = 0
+                
+                    # Sort by vote count in descending order
+                    countries_list = sorted(countries_list, key=lambda c: vote_data.get(c, 0), reverse=True)
+                    
                     # Cache the country list
-                    self.cached["COUNTRY_LIST"] = list(countries)
+                    self.cached["COUNTRY_LIST"] = countries_list
                     self.save_cache()
                     
-                    return list(countries)
+                    return countries_list
         except Exception as e:
             print(f"Error fetching country list: {e}")
-        
-        # If we failed to get countries, return the default list
+    
+        # If we failed to get countries, return the default list sorted by votes if available
         print("Using default country list as fallback")
-        return COUNTRIES
+        if self.LATEST_DATA:
+            try:
+                # Sort by round2 vote count in descending order
+                return sorted(COUNTRIES, 
+                             key=lambda country: self.LATEST_DATA.get(country, {}).get('round2', 0),
+                             reverse=True)
+            except Exception:
+                pass
+    
+        # If sorting fails, fall back to alphabetical sort
+        return sorted(COUNTRIES)
 
     def extract_country_data(self, url: str, country_name: str = None) -> tuple:
         """Extract data for a specific country."""
         if country_name is None:
             country_name = self.countries[0] if self.countries else COUNTRIES[0]  # Use dynamic list
+    
+        # Skip processing ROMANIA through the regular country method
+        # This prevents unnecessary requests for ROMANIA data since it's handled specially
+        if country_name.upper() == ROMANIA_NAME.upper():
+            return False, 0
     
         cache_key = f"{country_name}_{url}"
         
@@ -220,21 +265,34 @@ class DataProcessor:
     
     def extract_romania_data(self, total_url: str, straini_url: str, cache=True) -> tuple:
         """Calculate Romania votes by subtracting foreign votes from total."""
-        # Obține total
-        cached_total, total = self.extract_total(total_url, cache)
-        
-        # Obține străini
-        cached_straini, straini = self.extract_straini_total(straini_url, cache)
-        
-        # România = Total - Străinătate
-        romania = total - straini
-        
-        # Cache Romania result separately
-        if cache:
-            cache_key = f"romania_{total_url}_{straini_url}"
-            self.cached[cache_key] = int(romania)
-        
-        return (cached_total and cached_straini), romania
+        try:
+            # Check cache first
+            if cache:
+                cache_key = f"romania_{total_url}_{straini_url}"
+                if cache_key in self.cached:
+                    return True, self.cached[cache_key]
+            
+            # Try to get total response first to check if we're banned
+            total_response = requests.get(total_url, headers={"User-Agent": USER_AGENT}, verify=SSL_CERT_PATH)
+            straini_response = requests.get(straini_url, headers={"User-Agent": USER_AGENT}, verify=SSL_CERT_PATH)
+            
+            # Proceed only if both responses are successful
+            if total_response.status_code == 200 and straini_response.status_code == 200:
+                # Regular processing
+                cached_total, total = self.extract_total(total_url, cache)
+                cached_straini, straini = self.extract_straini_total(straini_url, cache)
+                romania = max(0, total - straini)
+                if cache:
+                    cache_key = f"romania_{total_url}_{straini_url}"
+                    self.cached[cache_key] = int(romania)
+                return (cached_total and cached_straini), romania
+            else:
+                # We might be banned or having connection issues
+                print(f"Access issue detected - Total: {total_response.status_code}, Straini: {straini_response.status_code}")
+                return False, 0
+        except Exception as e:
+            print(f"Error in extract_romania_data: {e}")
+            return False, 0
     
     def calculate_statistics(self, today_data, last_time_data):
         """Calculate delta percentages and hourly increases for given datasets."""
@@ -265,7 +323,7 @@ class DataProcessor:
         output_lines.append(f"┌{'─'*10}┬{'─'*14}┬{'─'*14}┬{'─'*14}┬{'─'*16}┬{'─'*10}┐")
         output_lines.append(f"│{' Data ':^10}│{' Tur 2 ':^14}│{' Tur 1 ':^14}│{' Diferență ':^14}│{' Creștere orară ':^16}│{' Delta ':^10}│")
         output_lines.append(f"├{'─'*10}┼{'─'*14}┼{'─'*14}┼{'─'*14}┼{'─'*16}┼{'─'*10}┤")
-        
+    
         last_time_data = np.zeros(len(dates))
         today_data = np.zeros(len(dates))
         
@@ -273,14 +331,24 @@ class DataProcessor:
         prev_hour_data = 0
         
         for i, (day, hour) in enumerate(dates):
-            # Build URLs
-            url_today = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND2}/data/json/simpv/presence/presence_sr_2025-05-{day:02d}_{hour:02d}-00.json"
-            url_prev = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND1}/data/json/simpv/presence/presence_sr_2025-05-{(day-DATE_DIFF):02d}_{hour:02d}-00.json"
-            
-            # Get data
-            cached_today, total_today = self.extract_country_data(url_today, country_name)
-            cached_prev, total_prev = self.extract_country_data(url_prev, country_name)
-            
+            # Special handling for ROMANIA - reuse existing extract_romania_data method
+            if country_name.upper() == ROMANIA_NAME.upper():
+                # Pentru România avem nevoie de două URL-uri
+                url_today_total = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND2}/data/json/simpv/presence/presence_2025-05-{day:02d}_{hour:02d}-00.json"
+                url_today_straini = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND2}/data/json/simpv/presence/presence_sr_2025-05-{day:02d}_{hour:02d}-00.json"
+                url_prev_total = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND1}/data/json/simpv/presence/presence_2025-05-{(day-DATE_DIFF):02d}_{hour:02d}-00.json"
+                url_prev_straini = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND1}/data/json/simpv/presence/presence_sr_2025-05-{(day-DATE_DIFF):02d}_{hour:02d}-00.json"
+                
+                cached_today, total_today = self.extract_romania_data(url_today_total, url_today_straini)
+                cached_prev, total_prev = self.extract_romania_data(url_prev_total, url_prev_straini)
+            else:
+                # Regular handling for other countries
+                url_today = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND2}/data/json/simpv/presence/presence_sr_2025-05-{day:02d}_{hour:02d}-00.json"
+                url_prev = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND1}/data/json/simpv/presence/presence_sr_2025-05-{(day-DATE_DIFF):02d}_{hour:02d}-00.json"
+                
+                cached_today, total_today = self.extract_country_data(url_today, country_name)
+                cached_prev, total_prev = self.extract_country_data(url_prev, country_name)
+        
             # Calculate hourly increase
             hourly_increase = total_today - prev_hour_data if i > 0 else total_today
             prev_hour_data = total_today
@@ -303,7 +371,7 @@ class DataProcessor:
                 self.LATEST_DATA[country_name]['round1'] = total_prev
                 self.LATEST_DATA[country_name]['round2'] = total_today
                 self.LATEST_DATA[country_name]['hourly_increase'] = hourly_increase
-        
+    
         # Add table footer
         output_lines.append(f"└{'─'*10}┴{'─'*14}┴{'─'*14}┴{'─'*14}┴{'─'*16}┴{'─'*10}┘")
         
@@ -463,19 +531,109 @@ class DataProcessor:
         self.save_cache()
 
     def plot_voting_data(self, ax, title, today_data, last_time_data, dates):
-        """Create a plot for voting data."""
+        """Create a plot for voting data with hover annotations."""
         ax.clear()
         ax.set_title(title)
-        ax.plot(today_data, label="turul 2")
-        ax.plot(last_time_data, label="turul 1")
-        ax.plot(today_data - last_time_data, label="diferenta")
-        ax.set_xticks(ticks=range(0, len(dates), 2))
-        ax.set_xticklabels([f"{hour}" for _, hour in dates[::2]])
-        ax.legend()
+        
+        # Plot the three lines
+        line1, = ax.plot(today_data, label="turul 2")
+        line2, = ax.plot(last_time_data, label="turul 1")
+        line3, = ax.plot(today_data - last_time_data, label="diferenta")
+        
+        # Set x-ticks to show only every 3 hours to prevent crowding
+        tick_interval = 3
+        ax.set_xticks(ticks=range(0, len(dates), tick_interval))
+        ax.set_xticklabels([f"{hour}" for _, hour in dates[::tick_interval]])
+        
+        # Move legend to the left
+        ax.legend(loc='upper left')
         ax.grid(True, linestyle='--', alpha=0.7)
+        
+        # Create vertical line for hover effect - make it dotted
+        vline = ax.axvline(0, color='gray', linestyle=':', alpha=0.8, visible=False)
+        
+        # Create annotation object - initial visibility False to avoid drawing until needed
+        annot = ax.annotate("", xy=(0,0), xytext=(0,0), textcoords="offset pixels",
+                   bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.9, ec="gray"),
+                   arrowprops=None, visible=False)
+    
+        # Store the lines and their corresponding data - precompute difference
+        diff_data = today_data - last_time_data
+    
+        # Flag to track if we're currently processing hover
+        is_processing = [False]
+        last_coord = [-1, -1]  # Track last processed position to avoid redundant updates
+    
+        def hover(event):
+            # Only process hover if the mouse is inside this axes and we're not already processing
+            if event.inaxes == ax and not is_processing[0]:
+                try:
+                    is_processing[0] = True
+                    x_coord = int(round(event.xdata))
+                    
+                    # Skip if same position as last time to avoid redrawing
+                    if x_coord == last_coord[0]:
+                        is_processing[0] = False
+                        return
+                    
+                    last_coord[0] = x_coord
+                    last_coord[1] = event.ydata
+                    
+                    if 0 <= x_coord < len(today_data):
+                        # Update the vertical line position - make it more visible
+                        vline.set_xdata([x_coord, x_coord])
+                        vline.set_visible(True)
+                        vline.set_alpha(0.8)  # Increased alpha for better visibility
+                        
+                        # Format timestamp
+                        time_str = ""
+                        if x_coord < len(dates):
+                            day, hour = dates[x_coord]
+                            time_str = f"[{day:02d} {hour:02d}:00]"
+                        
+                        # Collect data at this position - prepare all text at once
+                        text_parts = [f"Timestamp: {time_str}"]
+                        
+                        # Get values directly without looping
+                        t2_val = today_data[x_coord]
+                        t1_val = last_time_data[x_coord]
+                        diff_val = diff_data[x_coord]
+                        
+                        text_parts.append(f"Turul 2: {t2_val:,.0f}")
+                        text_parts.append(f"Turul 1: {t1_val:,.0f}")
+                        text_parts.append(f"Diferență: {diff_val:+,.0f}")
+                        
+                        # Position annotation directly at mouse pointer coordinates
+                        annot.xy = (x_coord, event.ydata)
+                        annot.xyann = (10, 10)  # Offset from cursor
+                        annot.set_text('\n'.join(text_parts))
+                        
+                        # Set visible and remove any arrow
+                        annot.set_visible(True)
+                        
+                        # Optimize redraw - only update what's needed
+                        ax.figure.canvas.draw_idle()
+                    else:
+                        # Hide annotation and line when outside plot area
+                        vline.set_visible(False)
+                        annot.set_visible(False)
+                        ax.figure.canvas.draw_idle()
+                except:
+                    pass
+                finally:
+                    is_processing[0] = False
+            elif event.inaxes != ax and annot.get_visible():
+                # Hide when mouse leaves the axes
+                vline.set_visible(False)
+                annot.set_visible(False)
+                ax.figure.canvas.draw_idle()
+    
+        # Connect event with throttling to reduce computational load
+        ax.figure.canvas.mpl_connect("motion_notify_event", hover)
+
 
     def plot_combined_stats(self, ax, delta_percents, hourly_increases, dates):
-        """Create a combined plot for delta percentages and hourly increases."""
+        """Create a combined plot for delta percentages and hourly increases with hover annotations."""
         ax.clear()
         ax_twin = ax.twinx()
         
@@ -483,24 +641,104 @@ class DataProcessor:
         ax.set_title("Creștere procentuală (Delta %) și Creștere orară")
         
         # Add TOTAL delta percentage line on the main axis
-        ax.plot(delta_percents["total"], label="TOTAL %", linewidth=4, color='darkblue')
+        line1, = ax.plot(delta_percents["total"], label="TOTAL %", linewidth=4, color='darkblue')
         
         # Add TOTAL hourly increase line on the secondary axis
-        ax_twin.plot(hourly_increases["total"], label="Creștere orară", linewidth=3, color='red', linestyle='--')
+        line2, = ax_twin.plot(hourly_increases["total"], label="Creștere orară", linewidth=3, color='red', linestyle='--')
         
-        # Set axis labels
-        ax.set_xticks(ticks=range(0, len(dates), 2))
-        ax.set_xticklabels([f"{hour}" for _, hour in dates[::2]])
+        # Set x-ticks to show only every 3 hours
+        tick_interval = 3
+        ax.set_xticks(ticks=range(0, len(dates), tick_interval))
+        ax.set_xticklabels([f"{hour}" for _, hour in dates[::tick_interval]])
         ax.set_ylabel('Creștere %')
         ax_twin.set_ylabel('Creștere orară (voturi)')
         
         # Add grid
         ax.grid(True, linestyle='--', alpha=0.7)
         
-        # Combine legends from both axes
+        # Move legend to the left
         lines1, labels1 = ax.get_legend_handles_labels()
         lines2, labels2 = ax_twin.get_legend_handles_labels()
         ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize='small')
+        
+        # Create vertical line for hover effect
+        vline = ax.axvline(0, color='gray', linestyle=':', alpha=0.8, visible=False)
+        
+        # Create annotation object with improved positioning
+        annot = ax.annotate("", xy=(0,0), xytext=(15,15), textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.9, ec="gray"),
+                    arrowprops=None, visible=False)
+
+        # Flag to track if we're currently processing hover
+        is_processing = [False]
+        last_coord = [-1, -1]  # Track last processed position
+
+        # Precompute data arrays for faster access
+        delta_data = delta_percents["total"]
+        hourly_data = hourly_increases["total"]
+        
+        def hover(event):
+            # Only process hover if inside axes and not already processing
+            if (event.inaxes in [ax, ax_twin]) and not is_processing[0]:
+                try:
+                    is_processing[0] = True
+                    x_coord = int(round(event.xdata))
+                    
+                    # Skip if same position as last time or invalid coordinate
+                    if x_coord == last_coord[0] or x_coord < 0:
+                        is_processing[0] = False
+                        return
+                    
+                    last_coord[0] = x_coord
+                    
+                    # Make sure the coordinates are valid
+                    if x_coord < len(delta_data):
+                        # Update the vertical line position
+                        vline.set_xdata([x_coord, x_coord])
+                        vline.set_visible(True)
+                        
+                        # Format timestamp
+                        time_str = ""
+                        if x_coord < len(dates):
+                            day, hour = dates[x_coord]
+                            time_str = f"[{day:02d} {hour:02d}:00]"
+                        
+                        # Prepare all text at once
+                        text_parts = [f"Timestamp: {time_str}"]
+                        
+                        # Get values directly - ensure we show some value even if data is missing
+                        delta_value = delta_data[x_coord] if x_coord < len(delta_data) else 0
+                        text_parts.append(f"Delta %: {delta_value:+.2f}%")
+                        
+                        hourly_value = hourly_data[x_coord] if x_coord < len(hourly_data) else 0
+                        text_parts.append(f"Creștere orară: {hourly_value:+,.0f}")
+                        
+                        # Position annotation at cursor position
+                        annot.xy = (x_coord, event.ydata)
+                        annot.set_text('\n'.join(text_parts))
+                        
+                        # Make annotation visible
+                        annot.set_visible(True)
+                        
+                        # Force redraw to ensure visibility
+                        ax.figure.canvas.draw_idle()
+                    else:
+                        # Hide annotation when outside plot area
+                        vline.set_visible(False)
+                        annot.set_visible(False)
+                        ax.figure.canvas.draw_idle()
+                except Exception as e:
+                    print(f"Hover error: {e}")
+                finally:
+                    is_processing[0] = False
+            elif event.inaxes not in [ax, ax_twin] and annot.get_visible():
+                # Hide when mouse leaves the axes
+                vline.set_visible(False)
+                annot.set_visible(False)
+                ax.figure.canvas.draw_idle()
+
+        # Connect event
+        ax.figure.canvas.mpl_connect("motion_notify_event", hover)
 
     def get_live_total(self):
         """Get the latest total vote count directly from the live endpoint"""
@@ -557,7 +795,7 @@ class DataProcessor:
     # Add a utility method to handle country name display
     def get_display_name(self, country):
         """Get a shortened display name for a country if needed"""
-        if country == "REGATUL UNIT AL MARII BRITANII \u0218I AL IRLANDEI DE NORD":
+        if country == "REGATUL UNIT AL MARII BRITANIEI \u0218I AL IRLANDEI DE NORD":
             return "MAREA BRITANIE"
         return country
     

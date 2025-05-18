@@ -41,39 +41,41 @@ class ElectionMonitorApp:
         self.data_processor = DataProcessor()
         self.running = True
         
-        # Now use the dynamic country list
-        self.selected_country = StringVar(root)
+        # Add ROMANIA to countries list and sort alphabetically
         if self.data_processor.countries:
-            self.selected_country.set(self.data_processor.countries[0])
+            if ROMANIA_NAME not in self.data_processor.countries:
+                self.data_processor.countries.append(ROMANIA_NAME)
+            sorted_countries = sorted(self.data_processor.countries)
+            self.data_processor.countries = sorted_countries
+            self.selected_country = StringVar(root)
+            # Start with ROMANIA selected by default
+            self.selected_country.set(ROMANIA_NAME)
         else:
-            self.selected_country.set(COUNTRIES[0])  # Fallback
+            countries_with_romania = COUNTRIES + [ROMANIA_NAME]
+            sorted_countries = sorted(countries_with_romania)
+            self.selected_country = StringVar(root)
+            self.selected_country.set(ROMANIA_NAME)  # Default to ROMANIA
     
         # Variables for tracking vote changes
         self.hour_start_votes = 0      # Votes at the beginning of the hour
         self.current_total_votes = 0   # Current total votes
         
+        # Add a flag to track if an update is in progress
+        self.update_in_progress = False
+        
         self.create_widgets()
         self.create_plots()
-        
-        # Start update thread
-        self.update_thread = threading.Thread(target=self.auto_update)
-        self.update_thread.daemon = True
-        self.update_thread.start()
         
         # Initial update
         self.update_data()
         
-        # Make sure the votes display gets updated even if initial data fetch failed
-        if self.hour_start_votes == 0 and self.current_total_votes > 0:
-            now = datetime.now()
-            self.hour_start_votes = self.current_total_votes - int(self.current_total_votes * 0.1 * (now.minute / 60))
-            self.update_new_votes_display()
-    
-        # Schedule regular vote count updates
-        self.root.after(10000, self.update_new_votes_count)
-        
-        # Schedule reset at next hour
-        self.schedule_next_hour_reset()
+        # After the initial update, properly initialize the hour_start_votes
+        # based on the current hour
+        now = datetime.now()
+        if self.hour_start_votes == 0 and 'total' in self.data_processor.LATEST_DATA:
+            # Use exactly the same total vote count from LATEST_DATA without estimation
+            self.hour_start_votes = self.data_processor.LATEST_DATA['total']['round2']
+            print(f"Initial baseline votes set to: {self.hour_start_votes:,} (from LATEST_DATA)")
 
     def exit_fullscreen(self, event=None):
         """Exit fullscreen mode when Escape key is pressed"""
@@ -91,30 +93,16 @@ class ElectionMonitorApp:
         control_frame = ttk.Frame(self.root, padding=CONTROL_PADDING)
         control_frame.pack(fill=tk.X)
         
-        # Country selection with integrated search - replace search frame and combobox
+        # Country selection - simple version without search
         ttk.Label(control_frame, text="Select Country:").pack(side=tk.LEFT, padx=5)
         
-        # Create custom combobox with search - change to 'state="normal"' instead of readonly
+        # Create standard combobox
         self.country_menu = ttk.Combobox(control_frame, textvariable=self.selected_country, 
-                      values=self.data_processor.countries, width=30, state="normal")
+                      values=self.data_processor.countries, width=30, state="readonly")
         self.country_menu.pack(side=tk.LEFT, padx=5)
         
-        # Add flag to track if typing has started in the combobox
-        self.typing_started = False
-        
-        # Bind events for search functionality
-        self.country_menu.bind("<KeyRelease>", self.on_combobox_keyrelease)
-        self.country_menu.bind("<KeyPress>", self.on_combobox_keypress)  # New binding
-        self.country_menu.bind("<<ComboboxSelected>>", self.on_country_selected)
-        self.country_menu.bind("<Return>", self.on_combobox_enter)
-        self.country_menu.bind("<FocusOut>", self.on_combobox_focus_lost)
-        self.country_menu.bind("<FocusIn>", self.on_combobox_focus)  # New binding
-        
-        # Store the original country list for quick restoration
-        self.original_country_list = list(self.data_processor.countries)
-        
-        # Variable to store the current search term
-        self.last_search_term = ""
+        # Bind the country selection event
+        self.country_menu.bind("<<ComboboxSelected>>", self.on_country_changed)
         
         # Update button
         update_button = ttk.Button(control_frame, text="Update Now", command=self.update_data)
@@ -225,147 +213,6 @@ class ElectionMonitorApp:
         self.summary_text.insert(tk.END, text + "\n")
         self.summary_text.see(tk.END)  # Auto-scroll to the end
 
-    def on_combobox_keypress(self, event=None):
-        """Handle first keypress in the combobox - clear the field"""
-        # Skip special keys
-        if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Escape', 'Tab', 'Return'):
-            return
-            
-        # On first character typed, clear the field
-        if not self.typing_started and event.char:
-            self.typing_started = True
-            self.country_menu.delete(0, 'end')
-
-    def on_combobox_keyrelease(self, event=None):
-        """Handle typing in the combobox"""
-        # Skip special keys
-        if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Escape', 'Tab', 'Return'):
-            return
-    
-        # Get current text in combobox
-        search_term = self.country_menu.get()
-        self.last_search_term = search_term
-        
-        # Filter the country list
-        if search_term:
-            # Search for matching countries
-            matching_countries = self.data_processor.search_countries(search_term)
-            
-            # Update dropdown list without changing the entry text
-            current_text = self.country_menu.get()  # Save current text
-            self.country_menu['values'] = matching_countries
-            self.country_menu.set(current_text)  # Restore text
-            
-            # Keep the dropdown open but don't change selection
-            current_position = self.country_menu.index('insert')  # Save cursor position
-            self.country_menu.event_generate('<Down>')
-            self.country_menu.icursor(current_position)  # Restore cursor position
-        else:
-            # Reset to full list if cleared
-            self.country_menu['values'] = self.original_country_list
-
-    def on_country_selected(self, event=None):
-        """Handle selection from the dropdown"""
-        # Get the selected value directly from the combobox
-        selected = self.country_menu.get()
-        
-        # Search for the closest match in our country list
-        if selected:
-            exact_match = None
-            # Try exact match first
-            if selected in self.data_processor.countries:
-                exact_match = selected
-            else:
-                # Try case-insensitive match
-                for country in self.data_processor.countries:
-                    if country.lower() == selected.lower():
-                        exact_match = country
-                        break
-            
-                # If still no match, try starting with
-                if not exact_match:
-                    for country in self.data_processor.countries:
-                        if country.lower().startswith(selected.lower()):
-                            exact_match = country
-                            break
-        
-        # If we found a match, use it
-        if exact_match:
-            self.selected_country.set(exact_match)
-            self.country_menu.set(exact_match)  # Set the visible text
-            self.on_country_changed()
-            
-            # Reset search state and typing flag
-            self.last_search_term = ""
-            self.typing_started = False
-            self.country_menu['values'] = self.original_country_list
-
-    def on_combobox_enter(self, event=None):
-        """Handle Enter key in combobox"""
-        # Get current values in dropdown
-        values = self.country_menu['values']
-        
-        # If there are values and current text matches or is a prefix of one
-        if values and len(values) > 0:
-            search_term = self.country_menu.get().lower()
-            
-            # Look for direct match first
-            exact_match = None
-            for country in values:
-                if country.lower() == search_term:
-                    exact_match = country
-                    break
-            
-            # If no exact match, find closest match
-            if not exact_match and search_term:
-                for country in values:
-                    if country.lower().startswith(search_term):
-                        exact_match = country
-                        break
-            
-            # If still no match, just use the first item
-            if not exact_match and values:
-                exact_match = values[0]
-            
-            if exact_match:
-                # Select the matching item
-                self.selected_country.set(exact_match)
-                self.country_menu.set(exact_match)
-                
-                # Trigger the country changed event
-                self.on_country_changed()
-                
-                # Reset search state
-                self.last_search_term = ""
-                self.country_menu['values'] = self.original_country_list
-
-    def on_combobox_focus_lost(self, event=None):
-        """Reset the combobox when it loses focus"""
-        # Wait a moment to avoid conflicts with selection
-        self.root.after(100, self._delayed_combobox_focus_lost)
-
-    def _delayed_combobox_focus_lost(self):
-        """Delayed handling of focus loss"""
-        # Only reset if no selection was made
-        if not self.typing_started:
-            # Get current selected country
-            current = self.selected_country.get()
-            
-            # Reset the dropdown text to match the selected country
-            if current and current in self.data_processor.countries:
-                self.country_menu.set(current)
-    
-        # Always reset typing flag and dropdown list
-        self.typing_started = False
-        self.country_menu['values'] = self.original_country_list
-        self.last_search_term = ""
-
-    def on_combobox_focus(self, event=None):
-        """When focus enters the combobox, prepare for typing"""
-        # Don't reset typing_started flag yet - wait for actual typing
-        # Store the current text in case we need to restore it
-        self.before_focus_text = self.country_menu.get()
-
     def on_country_changed(self, event=None):
         """Handle country selection change"""
         self.clear_console()
@@ -375,7 +222,7 @@ class ElectionMonitorApp:
         dates = self.data_processor.get_dates()
         
         if dates:
-            # Get console output for the selected country
+            # Get console output for the selected country from existing data, don't fetch new data
             country_output, _, _ = self.data_processor.process_country_data_with_output(dates, selected_country)
             
             # Display in left console widget
@@ -388,103 +235,73 @@ class ElectionMonitorApp:
             # Add summary section to right console
             summary_output = self.generate_summary_text()
             self.write_to_summary_console(summary_output)
-    
-        # Update plots
-        self.update_plots()
+            
+            # Make sure plots are updated when country changes
+            self.update_plots()
 
     def update_data(self):
         """Update all data from the API"""
-        # Add debug info
-        print("================= UPDATE DATA STARTED =================")
-        self.status_var.set("Updating data...")
-        self.root.update_idletasks()
-        
-        # Clear console
-        self.clear_console()
-        
-        # Process data
-        selected_country = self.selected_country.get()
-        dates = self.data_processor.get_dates()
-        
-        if dates:
-            # Get console output for the selected country
-            country_output, today_data, last_time_data = self.data_processor.process_country_data_with_output(dates, selected_country)
+        try:
+            # Add debug info
+            print("================= UPDATE DATA STARTED =================")
+            self.status_var.set("Updating data...")
+            self.root.update_idletasks()
             
-            # Display country data in left console
-            self.write_to_country_console(country_output)
+            # Clear console
+            self.clear_console()
             
-            # Process all other data normally
-            self.data_processor.update_all_data()
+            # Process data
+            selected_country = self.selected_country.get()
+            dates = self.data_processor.get_dates()
             
-            # Process total data for display in right console
-            total_output = self.get_total_data_output(dates)
-            self.write_to_summary_console(total_output)
-            
-            # Add summary section to right console
-            summary_output = self.generate_summary_text()
-            self.write_to_summary_console(summary_output)
-            
-            # Update plots
-            self.update_plots()
-            
-            # IMPORTANT: Get FRESH current total votes directly from the website
-            # This ensures we always have the latest data when clicking Update Now
-            try:
-                # Get the latest vote count
-                fresh_total = self.data_processor.get_live_total()
+            if dates:
+                # Get the current live total from the API
+                current_total = self.data_processor.get_live_total()
                 
-                print(f"FRESH REQUEST:")
-                print(f"  Using presence_now.json endpoint")
-                print(f"  Old total: {self.current_total_votes}")
-                print(f"  New total: {fresh_total}")
+                # Update data processor
+                self.data_processor.update_all_data()
                 
-                if fresh_total > 0:
-                    # Update current_total_votes with fresh data
-                    self.current_total_votes = fresh_total
-                    
-                    # Initialize hour_start_votes if this is the first update
-                    if self.hour_start_votes == 0:
-                        now = datetime.now()
-                        # If we're at the start of the hour (within first minute), set it to current
-                        if now.minute < 2:
-                            self.hour_start_votes = fresh_total
-                        else:
-                            # Otherwise, estimate the value at the start of the hour
-                            hourly_inc = max(1, self.data_processor.LATEST_DATA['total'].get('hourly_increase', 1000))
-                            estimated_hour_votes = int(hourly_inc * (now.minute / 60))
-                            self.hour_start_votes = max(0, fresh_total - estimated_hour_votes)
-                        
-                        print(f"  Initialized hour_start_votes to: {self.hour_start_votes}")
-            except Exception as e:
-                print(f"Error fetching fresh data: {e}")
-                # Fall back to the data from the normal update process
-                if 'total' in self.data_processor.LATEST_DATA:
-                    self.current_total_votes = self.data_processor.LATEST_DATA['total']['round2']
+                # Display selected country data
+                country_output, today_data, last_time_data = self.data_processor.process_country_data_with_output(dates, selected_country)
+                self.write_to_country_console(country_output)
+                
+                # Display summary data
+                self.update_summary()
+                
+                # Update plots
+                self.update_plots()
+                
+                # Store current total for next calculation
+                if current_total > 0:
+                    self.current_total_votes = current_total
     
-        # Update status with vote info
-        now = datetime.now()
-        current_hour = now.hour
-        hourly_votes = 0
-        if self.hour_start_votes > 0:
-            hourly_votes = max(0, self.current_total_votes - self.hour_start_votes)
-    
-        print(f"STATUS UPDATE VALUES:")
-        print(f"  hour_start_votes: {self.hour_start_votes}")
-        print(f"  current_total_votes: {self.current_total_votes}")
-        print(f"  calculated hourly_votes: {hourly_votes}")
-        
-        # Update status with vote info
-        next_update, seconds = self.data_processor.calculate_next_update_time()
+                # Update hour_start_votes if this is a scheduled update
+                now = datetime.now()
+                if now.minute == UPDATE_MINUTE and now.second >= UPDATE_SECOND:
+                    # Use the value from LATEST_DATA instead of current_total
+                    if 'total' in self.data_processor.LATEST_DATA and 'round2' in self.data_processor.LATEST_DATA['total']:
+                        self.hour_start_votes = self.data_processor.LATEST_DATA['total']['round2']
+                        print(f"Regular update - reset baseline votes count to: {self.hour_start_votes}")
+                # If hour_start_votes is not set (first run), set it to the value from LATEST_DATA
+                elif self.hour_start_votes == 0:
+                    if 'total' in self.data_processor.LATEST_DATA and 'round2' in self.data_processor.LATEST_DATA['total']:
+                        self.hour_start_votes = self.data_processor.LATEST_DATA['total']['round2']
+                        print(f"First run - initial baseline votes count: {self.hour_start_votes}")
 
-        # Format the status message with vote count
-        status_msg = (f"Last updated: {now.strftime('%H:%M:%S')} - "
-                    f"Next update: {next_update.strftime('%H:%M:%S')} - "
-                    f"New votes since {current_hour:02d}:00: +{hourly_votes:,}")
-
-        self.status_var.set(status_msg)
-        print(f"  Status set to: {status_msg}")
-        
-        print("================= UPDATE DATA FINISHED =================")
+            # Always update the display regardless of whether new data was fetched
+            self.update_new_votes_display()  # This will update the status with vote count
+            
+            print("================= UPDATE DATA FINISHED =================")
+            
+        except Exception as e:
+            # Log error and ensure UI isn't stuck
+            print(f"Error during data update: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Reset status to show error occurred
+            now = datetime.now()
+            self.status_var.set(f"Update failed at {now.strftime('%H:%M:%S')} - Check console for errors")
 
     def get_total_data_output(self, dates):
         """Get formatted total data output for the console"""
@@ -504,35 +321,57 @@ class ElectionMonitorApp:
         # For tracking hourly increases
         prev_hour_data = 0
         
-        today_data = []
-        last_time_data = []
+        selected_country = self.selected_country.get()
         
-        for i, (day, hour) in enumerate(dates):
-            # Build URLs
-            url_today = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND2}/data/json/simpv/presence/presence_2025-05-{day:02d}_{hour:02d}-00.json"
-            url_prev = f"https://prezenta.roaep.ro/prezidentiale{ELECTION_DATE_ROUND1}/data/json/simpv/presence/presence_2025-05-{(day-DATE_DIFF):02d}_{hour:02d}-00.json"
+        # Special handling for ROMANIA - use the data from the ROMANIA key in country_data
+        if selected_country == ROMANIA_NAME and ROMANIA_NAME in self.data_processor.country_data:
+            today_data = self.data_processor.country_data[ROMANIA_NAME]['today']
+            last_time_data = self.data_processor.country_data[ROMANIA_NAME]['previous']
             
-            # Get data
-            _, total_today = self.data_processor.extract_total(url_today)
-            _, total_prev = self.data_processor.extract_total(url_prev)
-            
-            today_data.append(total_today)
-            last_time_data.append(total_prev)
-            
-            # Calculate hourly increase
-            hourly_increase = total_today - prev_hour_data if i > 0 else total_today
-            prev_hour_data = total_today
-            
-            # Format the time string
-            time_str = f"[{day:02d} {hour:02d}:01]"
-            
-            # Add table row to output
-            diff = total_today - total_prev
-            hourly_str = f"{hourly_increase:+,d}" if i > 0 else "N/A"
-            delta_str = f"{(diff / total_prev * 100):+.2f}%" if total_prev > 0 else "N/A"
-            
-            output_lines.append(f"│{time_str:^{tw['time']}}│{total_today:>{tw['round']},d}│{total_prev:>{tw['round']},d}│{diff:>+{tw['diff']},d}│{hourly_str:^{tw['hourly']}}│{delta_str:^{tw['delta']}}│")
-        
+            for i, (day, hour) in enumerate(dates):
+                # Format the time string
+                time_str = f"[{day:02d} {hour:02d}:01]"
+                
+                # Get values for this timestamp
+                total_today = today_data[i] if i < len(today_data) else 0
+                total_prev = last_time_data[i] if i < len(last_time_data) else 0
+                diff = total_today - total_prev
+                
+                # Calculate hourly increase
+                hourly_increase = total_today - prev_hour_data if i > 0 else 0
+                hourly_str = f"{int(hourly_increase):+,d}" if i > 0 else "N/A"
+                prev_hour_data = total_today
+                
+                # Calculate delta percentage
+                delta_str = f"{(diff / total_prev * 100):+.2f}%" if total_prev > 0 else "N/A"
+                
+                output_lines.append(f"│{time_str:^{tw['time']}}│{int(total_today):>{tw['round']},d}│{int(total_prev):>{tw['round']},d}│{int(diff):>+{tw['diff']},d}│{hourly_str:^{tw['hourly']}}│{delta_str:^{tw['delta']}}│")
+        # For any other country or total, use the regular data
+        elif 'total' in self.data_processor.country_data and selected_country != ROMANIA_NAME:
+            key = 'total' if selected_country == 'total' else selected_country
+            if key in self.data_processor.country_data:
+                today_data = self.data_processor.country_data[key]['today']
+                last_time_data = self.data_processor.country_data[key]['previous']
+                
+                for i, (day, hour) in enumerate(dates):
+                    # Format the time string
+                    time_str = f"[{day:02d} {hour:02d}:01]"
+                    
+                    # Get values for this timestamp
+                    total_today = today_data[i] if i < len(today_data) else 0
+                    total_prev = last_time_data[i] if i < len(last_time_data) else 0
+                    diff = total_today - total_prev
+                    
+                    # Calculate hourly increase
+                    hourly_increase = total_today - prev_hour_data if i > 0 else 0
+                    hourly_str = f"{int(hourly_increase):+,d}" if i > 0 else "N/A"
+                    prev_hour_data = total_today
+                    
+                    # Calculate delta percentage
+                    delta_str = f"{(diff / total_prev * 100):+.2f}%" if total_prev > 0 else "N/A"
+                    
+                    output_lines.append(f"│{time_str:^{tw['time']}}│{int(total_today):>{tw['round']},d}│{int(total_prev):>{tw['round']},d}│{int(diff):>+{tw['diff']},d}│{hourly_str:^{tw['hourly']}}│{delta_str:^{tw['delta']}}│")
+    
         # Add table footer
         output_lines.append(f"└{'─'*tw['time']}┴{'─'*tw['round']}┴{'─'*tw['round']}┴{'─'*tw['diff']}┴{'─'*tw['hourly']}┴{'─'*tw['delta']}┘")
         
@@ -541,8 +380,49 @@ class ElectionMonitorApp:
     def generate_summary_text(self):
         """Generate summary text for console display"""
         output_lines = []
+    
+        # Add total votes history section
+        output_lines.append("\n" + TABLE_SUMMARY_DIVIDER_CHAR * TABLE_SUMMARY_HEADER_LEN)
+        output_lines.append("  ISTORICUL VOTURILOR TOTALE  ".center(TABLE_SUMMARY_HEADER_LEN, TABLE_SUMMARY_DIVIDER_CHAR))
+        output_lines.append(TABLE_SUMMARY_DIVIDER_CHAR * TABLE_SUMMARY_HEADER_LEN)
         
-        # Header
+        # Get total votes history from data processor
+        dates = self.data_processor.get_dates()
+        if dates and 'total' in self.data_processor.country_data:
+            today_data = self.data_processor.country_data['total']['today']
+            last_time_data = self.data_processor.country_data['total']['previous']
+            
+            # Table header for history
+            tw = TABLE_COL_WIDTHS
+            output_lines.append(f"┌{'─'*tw['time']}┬{'─'*tw['round']}┬{'─'*tw['round']}┬{'─'*tw['diff']}┬{'─'*tw['hourly']}┬{'─'*tw['delta']}┐")
+            output_lines.append(f"│{' Data ':^{tw['time']}}│{' Tur 2 ':^{tw['round']}}│{' Tur 1 ':^{tw['round']}}│{' Diferență ':^{tw['diff']}}│{' Creștere orară ':^{tw['hourly']}}│{' Delta ':^{tw['delta']}}│")
+            output_lines.append(f"├{'─'*tw['time']}┼{'─'*tw['round']}┼{'─'*tw['round']}┼{'─'*tw['diff']}┼{'─'*tw['hourly']}┼{'─'*tw['delta']}┤")
+            
+            # Add rows for each timestamp
+            prev_today = 0
+            for i, (day, hour) in enumerate(dates):
+                time_str = f"[{day:02d} {hour:02d}:00]"
+                
+                # Get values for this timestamp
+                total_today = today_data[i] if i < len(today_data) else 0
+                total_prev = last_time_data[i] if i < len(last_time_data) else 0
+                diff = total_today - total_prev
+                
+                # Calculate hourly increase
+                hourly_increase = total_today - prev_today if i > 0  else 0
+                hourly_str = f"{int(hourly_increase):+,d}" if i > 0 else "N/A"
+                prev_today = total_today
+                
+                # Calculate delta percentage
+                delta_str = f"{(diff / total_prev * 100):+.2f}%" if total_prev > 0 else "N/A"
+                
+                # Convert to integers before formatting to avoid the "float" error
+                output_lines.append(f"│{time_str:^{tw['time']}}│{int(total_today):>{tw['round']},d}│{int(total_prev):>{tw['round']},d}│{int(diff):>+{tw['diff']},d}│{hourly_str:^{tw['hourly']}}│{delta_str:^{tw['delta']}}│")
+                
+            # Table footer
+            output_lines.append(f"└{'─'*tw['time']}┴{'─'*tw['round']}┴{'─'*tw['round']}┴{'─'*tw['diff']}┴{'─'*tw['hourly']}┴{'─'*tw['delta']}┘")
+
+        # Header for summary section (existing code)
         output_lines.append("\n" + TABLE_SUMMARY_DIVIDER_CHAR * TABLE_SUMMARY_HEADER_LEN)
         output_lines.append("  REZUMAT DATE RECENTE  ".center(TABLE_SUMMARY_HEADER_LEN, TABLE_SUMMARY_DIVIDER_CHAR))
         output_lines.append(TABLE_SUMMARY_DIVIDER_CHAR * TABLE_SUMMARY_HEADER_LEN)
@@ -562,8 +442,8 @@ class ElectionMonitorApp:
         
         time_str = f"[{last_day:02d} {last_hour:02d}:00]"
         
-        # Generate rows for each country
-        for country in COUNTRIES:
+        # Generate rows for each country - using case-insensitive comparison 
+        for country in [c for c in COUNTRIES if c.upper() != ROMANIA_NAME.upper()]:
             data = self.data_processor.LATEST_DATA.get(country, {})
             r1 = data.get('round1', 0)
             r2 = data.get('round2', 0)
@@ -581,8 +461,28 @@ class ElectionMonitorApp:
             
             output_lines.append(f"│{time_str:^{tw['time']}}│{display_country:^{tw['country']}}│{r2:>{tw['round']},d}│{r1:>{tw['round']},d}│{diff:>+{tw['diff']},d}│{hourly:>+{tw['hourly']},d}│{delta_str:^{tw['delta']}}│")
         
-        # Add Romania and Total rows
-        self.add_summary_output_row(output_lines, time_str, ROMANIA_NAME, ROMANIA_NAME)
+        # Add Romania row - using case-insensitive lookup
+        # Look for romania in any case form
+        romania_key = next((k for k in self.data_processor.LATEST_DATA.keys() if k.upper() == ROMANIA_NAME.upper()), None)
+        
+        if romania_key:
+            data = self.data_processor.LATEST_DATA.get(romania_key, {})
+            r1 = data.get('round1', 0) 
+            r2 = data.get('round2', 0)
+            hourly = data.get('hourly_increase', 0)
+            diff = r2 - r1
+            
+            display_name = f"{ROMANIA_NAME} (fără străinătate)"
+            
+            if r1 > 0:
+                delta = round(diff / r1 * 100, 2)
+                delta_str = f"{delta:+.2f}%"
+            else:
+                delta_str = "N/A"
+            
+            output_lines.append(f"│{time_str:^{tw['time']}}│{display_name:^{tw['country']}}│{r2:>{tw['round']},d}│{r1:>{tw['round']},d}│{diff:>+{tw['diff']},d}│{hourly:>+{tw['hourly']},d}│{delta_str:^{tw['delta']}}│")
+        
+        # Add Total row
         self.add_summary_output_row(output_lines, time_str, 'total', 'TOTAL')
         
         # Table footer
@@ -649,6 +549,14 @@ class ElectionMonitorApp:
         # Adjust layout
         self.fig.tight_layout()
         self.canvas.draw()
+        
+        # Enable hover functionality by connecting the canvas events
+        self.canvas.mpl_connect('motion_notify_event', self._on_hover)
+
+    def _on_hover(self, event):
+        # This method exists to ensure the figure redraws properly when hovering
+        # The actual hover logic is handled in the plot_voting_data and plot_combined_stats methods
+        pass
 
     def update_summary(self):
         """Update the summary console with latest data"""
@@ -669,22 +577,16 @@ class ElectionMonitorApp:
         try:
             # Only do this if we have data
             if 'total' in self.data_processor.LATEST_DATA:
-                # Get the latest total
+                # Get the latest total directly from LATEST_DATA
                 new_total = self.data_processor.LATEST_DATA['total']['round2']
                 
                 # Update the current total
                 self.current_total_votes = new_total
                 
-                # Initialize hour_start_votes if needed
+                # Initialize hour_start_votes if needed - use exact value from data
                 if self.hour_start_votes == 0:
-                    now = datetime.now()
-                    if now.minute < 2:
-                        self.hour_start_votes = new_total
-                    else:
-                        hourly_inc = max(1, self.data_processor.LATEST_DATA['total'].get('hourly_increase', 1000))
-                        estimated_hour_votes = int(hourly_inc * (now.minute / 60))
-                        self.hour_start_votes = max(0, new_total - estimated_hour_votes)
-                
+                    self.hour_start_votes = new_total
+            
                 # Update the display
                 self.update_new_votes_display()
                 return True
@@ -693,104 +595,110 @@ class ElectionMonitorApp:
             print(f"Error updating vote count: {e}")
             return False
 
-    # Add this method to your ElectionMonitorApp class
-    def auto_update(self):
-        """Background thread for automatic updates"""
-        last_update_hour = datetime.now().hour
-        
-        while self.running:
-            now = datetime.now()
-            current_hour = now.hour
-            current_minute = now.minute
-            current_second = now.second
-            
-            # Update at the specified minute and second of each hour
-            if (current_hour != last_update_hour and 
-                current_minute >= UPDATE_MINUTE and current_second >= UPDATE_SECOND):
-                
-                # Update on the GUI thread
-                self.root.after(0, self.update_data)
-                last_update_hour = current_hour
-            
-            # Sleep briefly to avoid high CPU usage
-            time.sleep(1)
-
     def update_new_votes_display(self):
         """Update the display of new votes in the current hour"""
-        now = datetime.now()
-        current_hour = now.hour
-        
-        # Calculate votes in current hour
-        hourly_votes = 0
-        if self.hour_start_votes > 0:
-            hourly_votes = max(0, self.current_total_votes - self.hour_start_votes)
-    
-        # Update status with vote info
-        next_update, seconds = self.data_processor.calculate_next_update_time()
-
-        # Format the status message with vote count
-        status_msg = (f"Last updated: {now.strftime('%H:%M:%S')} - "
-                    f"Next update: {next_update.strftime('%H:%M:%S')} - "
-                    f"New votes since {current_hour:02d}:00: +{hourly_votes:,}")
-
-        self.status_var.set(status_msg)
-
-    def update_new_votes_count(self):
-        """Update only the time display without making web requests"""
         try:
-            # Update just the time portion of the status message
             now = datetime.now()
             current_hour = now.hour
-            next_update, seconds = self.data_processor.calculate_next_update_time()
             
-            # Get the current vote count (without making a new request)
+            # Make sure we have the most accurate current total
+            # First try to get live total
+            latest_total = self.data_processor.get_live_total()
+            
+            # If successful, use that value
+            if latest_total > 0:
+                self.current_total_votes = latest_total
+            # Otherwise fall back to cached data
+            elif 'total' in self.data_processor.LATEST_DATA and 'round2' in self.data_processor.LATEST_DATA['total']:
+                self.current_total_votes = self.data_processor.LATEST_DATA['total']['round2']
+
+            # Calculate new votes since hour start
             hourly_votes = 0
             if self.hour_start_votes > 0:
                 hourly_votes = max(0, self.current_total_votes - self.hour_start_votes)
             
-            # Format the status message
-            status_msg = (f"Last updated: {now.strftime('%H:%M:%S')} - "
-                         f"Next update: {next_update.strftime('%H:%M:%S')} - "
-                         f"New votes since {current_hour:02d}:00: +{hourly_votes:,}")
+            # Get next update time
+            next_update, seconds = self.data_processor.calculate_next_update_time()
             
+            # Format the status message with vote count (removed Romania counter)
+            status_msg = (f"Last updated: {now.strftime('%H:%M:%S')} - "
+                        f"Next update: {next_update.strftime('%H:%M:%S')} - "
+                        f"New votes since {current_hour:02d}:00: +{hourly_votes:,}")
+            
+            # Actually update the status var with the complete message
             self.status_var.set(status_msg)
-                
+            print(f"Display updated: Hour baseline: {self.hour_start_votes:,}, Current total: {self.current_total_votes:,}, "
+                  f"New votes: +{hourly_votes:,}")
+            
         except Exception as e:
-            print(f"Error updating time display: {e}")
-        
-        # Schedule next update in 1 second if still running
-        if self.running:
-            self.root.after(10000, self.update_new_votes_count)
+            print(f"Error updating vote display: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def update_new_votes_count(self):
+        """Update the vote count in the status bar"""
+        try:
+            # Get the latest total from data processor
+            latest_total = self.data_processor.LATEST_DATA['total']['round2']
+            
+            # Calculate new votes since the hour start
+            # Use abs() to ensure we always show a positive value
+            new_votes = abs(latest_total - self.hour_start_votes) if self.hour_start_votes > 0 else 0
+            
+            # Update the status bar
+            current_status = self.status_var.get()
+            # Replace just the vote count part at the end of the status message
+            now = datetime.now()
+            current_hour = now.hour
+            prefix = current_status.split(f"New votes since {current_hour:02d}:00:")[0]
+            self.status_var.set(f"{prefix}New votes since {current_hour:02d}:00: +{abs(new_votes):,}")
+            
+            # Remove auto-scheduling - only update when button is clicked
+        except Exception as e:
+            print(f"Error updating vote count: {e}")
+            # Remove auto-scheduling here too
 
     def schedule_next_hour_reset(self):
-        """Schedule the next hourly reset of the vote counter"""
-        now = datetime.now()
-        
-        # Calculate time until the next hour
-        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        delta = (next_hour - now).total_seconds() * 1000  # Convert to milliseconds for after()
-        
-        # Schedule the reset
-        self.root.after(int(delta), self.reset_hour_start_votes)
+        """
+        This method is no longer used as we synchronize vote counter resets 
+        with the data updates at the configured time (UPDATE_MINUTE:UPDATE_SECOND)
+        """
+        pass
 
     def reset_hour_start_votes(self):
-        """Reset the vote counter at the start of a new hour"""
+        """Reset the hour's starting vote count without checking for updates."""
+        # Only reset the counter, don't check for new data
         self.hour_start_votes = self.current_total_votes
     
-        # Update the display
-        self.update_new_votes_display()
-        
-        # Schedule the next reset
+        # Schedule next hour reset
         self.schedule_next_hour_reset()
 
     def update_clock(self):
-        """Update the real-time clock display"""
-        current_time = datetime.now().strftime('%H:%M:%S')
-        self.clock_var.set(current_time)
+        """Update the clock display and check for scheduled updates."""
+        # Update the clock display
+        now = datetime.now()
+        time_str = now.strftime("%d/%m/%Y %H:%M:%S")
+        self.clock_var.set(time_str)
         
-        # Schedule the next update in 1000ms (1 second)
-        if self.running:
-            self.root.after(1000, self.update_clock)
+        # Check if it's time for a scheduled update (XX:01:01)
+        if now.minute == UPDATE_MINUTE and now.second == UPDATE_SECOND:
+            print(f"Auto update triggered at {now.strftime('%H:%M:%S')}")
+            if not self.update_in_progress:
+                # Start update in a background thread
+                update_thread = threading.Thread(target=self.run_update)
+                update_thread.daemon = True
+                update_thread.start()
+        
+        # Schedule the next clock update in 1 second
+        self.root.after(1000, self.update_clock)
+
+    def run_update(self):  # Fixed indentation - moved out of update_clock to class level
+        """Run the update in a separate thread to avoid freezing the UI"""
+        try:
+            self.update_in_progress = True
+            self.update_data()
+        finally:
+            self.update_in_progress = False
 
 # Add this at the end of the file
 def main():
